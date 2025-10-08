@@ -22,8 +22,8 @@ jobs:
     - name: Run AI code analysis
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        LLM_API_TYPE: openrouter
-        MODEL: "openai/gpt-oss-20b:free"
+        LLM_API_TYPE: gemini
+        MODEL: "flash-2.5"
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         PR_NUMBER_FROM_WORKFLOW_DISPATCH: ${{ github.event.inputs.pr_number }}
       run: |
