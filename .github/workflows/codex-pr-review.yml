@@ -1,32 +1,37 @@
-name: Codex PR Review
-
+name: "Gito: AI Code Review"
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-
-permissions:
-  contents: read
-  pull-requests: write
-
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull Request number"
+        required: true
 jobs:
   review:
     runs-on: ubuntu-latest
+    permissions: { contents: read, pull-requests: write } # 'write' for leaving the summary comment
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install deps
-        run: |
-          npm init -y >/dev/null 2>&1 || true
-          npm i @openai/codex-sdk @octokit/rest
-
-      - name: Run Codex review
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: node .github/tools/codex-pr-review.js
+    - uses: actions/checkout@v4
+      with: { fetch-depth: 0 }
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with: { python-version: "3.13" }
+    - name: Install AI Code Review tool
+      run: pip install gito.bot~=3.0
+    - name: Run AI code analysis
+      env:
+        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        LLM_API_TYPE: openai
+        MODEL: "openai/gpt-oss-20b:free"
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_NUMBER_FROM_WORKFLOW_DISPATCH: ${{ github.event.inputs.pr_number }}
+      run: |
+        gito --verbose review
+        gito github-comment --token ${{ secrets.GITHUB_TOKEN }}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ai-code-review-results
+        path: |
+          code-review-report.md
+          code-review-report.json
