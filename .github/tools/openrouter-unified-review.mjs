@@ -34,22 +34,38 @@ const [OWNER, REPO_NAME] = REPO.split("/");
 
 // -------------------- Utilities --------------------
 function extractJsonFromText(s) {
-  if (!s || typeof s !== "string") return null;
-  // try direct
-  try { return JSON.parse(s); } catch {}
-  // try fenced ```json ... ```
+  if (!s || typeof s !== "string") {
+    console.error("❌ Empty or non-string response from OpenRouter");
+    return null;
+  }
+  // Try direct JSON
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    console.error(`❌ Direct JSON parse failed: ${e.message}`);
+  }
+  // Try fenced ```json ... ```
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(s);
   if (fence) {
     const inner = fence[1].trim();
-    try { return JSON.parse(inner); } catch {}
+    try {
+      return JSON.parse(inner);
+    } catch (e) {
+      console.error(`❌ Fenced JSON parse failed: ${e.message}`);
+    }
   }
-  // try largest {...}
+  // Try largest {...}
   const first = s.indexOf("{");
   const last = s.lastIndexOf("}");
   if (first !== -1 && last !== -1 && last > first) {
     const candidate = s.slice(first, last + 1);
-    try { return JSON.parse(candidate); } catch {}
+    try {
+      return JSON.parse(candidate);
+    } catch (e) {
+      console.error(`❌ Largest {...} JSON parse failed: ${e.message}`);
+    }
   }
+  console.error(`❌ No valid JSON found in response: ${s.slice(0, 200)}...`);
   return null;
 }
 
@@ -81,55 +97,67 @@ function mergeFindings(all) {
 }
 
 // -------------------- OpenRouter call --------------------
-async function callOpenRouter(prompt) {
-  console.log(`🔎 Calling OpenRouter model: ${OR_MODEL}`);
-  const body = {
-    model: OR_MODEL,
-    temperature: 0,
-    max_tokens: 1000,
-    // Honored by many models; harmless if ignored
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: "You are a careful, structured code reviewer that MUST return valid JSON only (one JSON object). No extra prose, no markdown, no code fences." },
-      { role: "user", content: prompt }
-    ]
-  };
+async function callOpenRouter(prompt, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    console.log(`🔎 Attempt ${attempt}/${retries} calling OpenRouter model: ${OR_MODEL}`);
+    const body = {
+      model: OR_MODEL,
+      temperature: 0,
+      max_tokens: 1000,
+      // Honored by many models; harmless if ignored
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "You are a careful, structured code reviewer that MUST return valid JSON only (one JSON object). No extra prose, no markdown, no code fences." },
+        { role: "user", content: prompt }
+      ]
+    };
 
-  const res = await fetch(`${OR_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${OR_KEY}`,
-      ...(process.env.OR_SITE_URL ? { "HTTP-Referer": process.env.OR_SITE_URL } : {}),
-      ...(process.env.OR_PROJECT_NAME ? { "X-Title": process.env.OR_PROJECT_NAME } : {})
-    },
-    body: JSON.stringify(body)
-  });
+    try {
+      const res = await fetch(`${OR_BASE}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${OR_KEY}`,
+          ...(process.env.OR_SITE_URL ? { "HTTP-Referer": process.env.OR_SITE_URL } : {}),
+          ...(process.env.OR_PROJECT_NAME ? { "X-Title": process.env.OR_PROJECT_NAME } : {})
+        },
+        body: JSON.stringify(body)
+      });
 
-  if (!res.ok) {
-    const txt = await res.text().catch(()=>"");
-    throw new Error(`OpenRouter API ${res.status}: ${txt}`);
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        if (res.status === 429) {
+          console.error("⚠️ Rate limit hit, consider waiting or reducing batch size");
+        }
+        throw new Error(`OpenRouter API ${res.status}: ${txt}`);
+      }
+      const j = await res.json();
+      const text = j?.choices?.[0]?.message?.content ?? "";
+      console.log(`📜 Raw OpenRouter response: ${text.slice(0, 200)}...`);
+      return text;
+    } catch (e) {
+      console.error(`❌ Attempt ${attempt} failed: ${e.message}`);
+      if (attempt === retries) throw e;
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); // Exponential backoff
+    }
   }
-  const j = await res.json();
-  const text = j?.choices?.[0]?.message?.content ?? "";
-  return text;
 }
 
 // -------------------- Prompt --------------------
 function promptForBatch(batch) {
   return `
-You are a senior code reviewer.
+You are a senior code reviewer. Your response MUST be a single, valid JSON object. Do NOT include markdown, prose, code fences, or any non-JSON content. Any deviation will break the parser.
 
 OUTPUT FORMAT (MANDATORY):
-Return exactly ONE JSON object only. No prose, no markdown, no code fences. The response must be valid JSON.
-
-Schema:
 {
   "findings": [
     { "file": "path/relative", "line": 123, "severity": "high|medium|low|info", "comment": "what & why", "suggestion"?: "small patch/snippet" }
   ],
   "summary": "1-2 sentence summary for this batch"
 }
+
+If you cannot analyze the input, return:
+{"findings": [], "summary": "Unable to analyze this batch."}
 
 If you are unsure, return:
 {"findings": [], "summary": "No major issues identified in this batch."}
@@ -175,7 +203,7 @@ async function postPRComment(owner, repo, prNumber, body) {
 }
 
 // -------------------- PR batching helpers --------------------
-const PR_MAX_BATCH_CHARS = 80_000; // smaller than full-repo to be safe
+const PR_MAX_BATCH_CHARS = 50_000; // Reduced from 80,000
 function makeUnifiedChunk(filename, patch) {
   return `--- a/${filename}\n+++ b/${filename}\n${patch}\n\n`;
 }
@@ -261,8 +289,8 @@ async function runPRReview() {
 // -------------------- Full repo path --------------------
 const INCLUDE_EXTS = [".js",".ts",".jsx",".tsx",".py",".java",".go",".rb",".php",".cs",".cpp",".c",".rs",".kt",".m",".swift",".sql",".sh",".yml",".yaml",".json"];
 const EXCLUDE_DIRS = [".git","node_modules","dist","build","out",".next",".venv","venv","coverage"];
-const MAX_BATCH_CHARS = 100_000;
-const MAX_FILE_CHARS = 40_000;
+const MAX_BATCH_CHARS = 60_000; // Reduced from 100,000
+const MAX_FILE_CHARS = 20_000; // Reduced from 40,000
 const MAX_FILES = 600;
 
 const isExcludedDir = (p) => EXCLUDE_DIRS.some(d => p.split(path.sep).includes(d));
@@ -282,11 +310,19 @@ function walk(dir) {
 }
 
 function sliceFileContent(p) {
-  let src = "";
-  try { src = fs.readFileSync(p, "utf8"); } catch { return null; }
-  if (!src.trim()) return null;
-  if (src.length > MAX_FILE_CHARS) src = src.slice(0, MAX_FILE_CHARS) + "\n... [truncated]";
-  return `\n// ===== FILE: ${path.relative(process.cwd(), p)} =====\n${src}`;
+  try {
+    const stats = fs.statSync(p);
+    if (stats.size > MAX_FILE_CHARS) {
+      console.warn(`⚠️ File ${p} exceeds ${MAX_FILE_CHARS} bytes, truncating`);
+    }
+    let src = fs.readFileSync(p, "utf8");
+    if (!src.trim()) return null;
+    if (src.length > MAX_FILE_CHARS) src = src.slice(0, MAX_FILE_CHARS) + "\n... [truncated]";
+    return `\n// ===== FILE: ${path.relative(process.cwd(), p)} =====\n${src}`;
+  } catch (e) {
+    console.error(`❌ Failed to read file ${p}: ${e.message}`);
+    return null;
+  }
 }
 
 function batchesFromFiles(files) {
