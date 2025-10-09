@@ -1,9 +1,12 @@
 name: OpenRouter Full Repo Review
 
 on:
+  # Manual trigger from ANY branch
   workflow_dispatch:
+  # Auto-run on pushes to any branch (change if you want)
   push:
-    branches: [ main ]
+    branches:
+      - '**'
 
 permissions:
   contents: read
@@ -11,42 +14,55 @@ permissions:
 jobs:
   full-review:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node (v20)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
+      # Debug the repo layout to avoid path issues
       - name: List repo (debug)
         run: |
+          echo "Branch: ${{ github.ref_name }}"
           pwd
           ls -la
           ls -la .github || true
           ls -la .github/tools || true
 
-      # If you prefer node-fetch explicitly, uncomment next 2 lines and add `import fetch from "node-fetch"`
-      # - name: Install deps
-      #   run: npm init -y >/dev/null 2>&1 || true && npm i node-fetch
-
+      # Check for required secret
       - name: Check OpenRouter secret
         run: |
           if [ -z "${{ secrets.OPENROUTER_API_KEY }}" ]; then
-            echo "❌ Missing OPENROUTER_API_KEY (add in Settings → Secrets → Actions)."; exit 1;
+            echo " Missing OPENROUTER_API_KEY (add in Settings → Secrets and variables → Actions)."
+            exit 1
           fi
-          echo "✅ OPENROUTER_API_KEY present"
+          echo " OPENROUTER_API_KEY present"
 
+      # Optional: set a default model if repo variable is not set
+      - name: Set default model (optional)
+        run: |
+          if [ -z "${{ vars.OPENROUTER_MODEL }}" ]; then
+            echo "No OPENROUTER_MODEL repo variable set; defaulting to openrouter/auto"
+            echo "OPENROUTER_MODEL=openrouter/auto" >> $GITHUB_ENV
+          else
+            echo "OPENROUTER_MODEL=${{ vars.OPENROUTER_MODEL }}" >> $GITHUB_ENV
+          fi
+
+      # Run the review script
       - name: Run full repo review (OpenRouter)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }} # optional repo variable; defaults to router
+          OPENROUTER_MODEL: ${{ env.OPENROUTER_MODEL }}   # from repo variable or default above
           OR_PROJECT_NAME: "GitHub Action: Full Repo Review"
           OR_SITE_URL: "https://github.com/${{ github.repository }}"
           GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
         run: node .github/tools/openrouter-full-review.mjs
 
+      # Upload the outputs (JSON + Markdown)
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
