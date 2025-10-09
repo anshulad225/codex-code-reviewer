@@ -8,7 +8,7 @@
  * Required env:
  *   OPENROUTER_API_KEY (secret)
  * Optional env:
- *   OPENROUTER_MODEL (repo variable) — defaults to "openrouter/auto"
+ *   OPENROUTER_MODEL (repo variable) — defaults to "anthropic/claude-3.5-sonnet"
  *   OR_PROJECT_NAME, OR_SITE_URL (optional metadata headers)
  * Inputs from workflow:
  *   GITHUB_TOKEN, REPO, PR_NUMBER (when running on PR)
@@ -17,9 +17,9 @@
 import fs from "fs";
 import path from "path";
 
-const OR_KEY   = process.env.OPENROUTER_API_KEY;
-const OR_MODEL = process.env.OPENROUTER_MODEL || "openrouter/auto";
-const OR_BASE  = (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "");
+const OR_KEY = process.env.OPENROUTER_API_KEY;
+const OR_MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-3.5-sonnet";
+const OR_BASE = (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "");
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const REPO = process.env.REPO || "";
 const PR_NUMBER = process.env.PR_NUMBER || "";
@@ -38,13 +38,11 @@ function extractJsonFromText(s) {
     console.error("❌ Empty or non-string response from OpenRouter");
     return null;
   }
-  // Try direct JSON
   try {
     return JSON.parse(s);
   } catch (e) {
     console.error(`❌ Direct JSON parse failed: ${e.message}`);
   }
-  // Try fenced ```json ... ```
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(s);
   if (fence) {
     const inner = fence[1].trim();
@@ -54,7 +52,6 @@ function extractJsonFromText(s) {
       console.error(`❌ Fenced JSON parse failed: ${e.message}`);
     }
   }
-  // Try largest {...}
   const first = s.indexOf("{");
   const last = s.lastIndexOf("}");
   if (first !== -1 && last !== -1 && last > first) {
@@ -104,7 +101,6 @@ async function callOpenRouter(prompt, retries = 3) {
       model: OR_MODEL,
       temperature: 0,
       max_tokens: 1000,
-      // Honored by many models; harmless if ignored
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "You are a careful, structured code reviewer that MUST return valid JSON only (one JSON object). No extra prose, no markdown, no code fences." },
@@ -138,15 +134,20 @@ async function callOpenRouter(prompt, retries = 3) {
     } catch (e) {
       console.error(`❌ Attempt ${attempt} failed: ${e.message}`);
       if (attempt === retries) throw e;
-      await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); // Exponential backoff
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
     }
   }
 }
 
 // -------------------- Prompt --------------------
-function promptForBatch(batch) {
+function promptForBatch(batch, isPR = false) {
+  const context = isPR
+    ? "You are reviewing unified diff patches from a GitHub PR. Each patch starts with '--- a/file' and '+++ b/file', followed by changes marked with '+' (added) or '-' (removed). Focus on the changed lines."
+    : "You are reviewing full source files. Each file starts with '// ===== FILE: path =====' followed by its content.";
   return `
-You are a senior code reviewer. Your response MUST be a single, valid JSON object. Do NOT include markdown, prose, code fences, or any non-JSON content. Any deviation will break the parser.
+${context}
+
+Your response MUST be a single, valid JSON object. Do NOT include markdown, prose, code fences, or any non-JSON content. Any deviation will break the parser.
 
 OUTPUT FORMAT (MANDATORY):
 {
@@ -197,13 +198,13 @@ async function postPRComment(owner, repo, prNumber, body) {
     body: JSON.stringify({ body })
   });
   if (!res.ok) {
-    const err = await res.text().catch(()=>"");
+    const err = await res.text().catch(() => "");
     throw new Error(`Failed to post PR comment: ${res.status} ${err}`);
   }
 }
 
 // -------------------- PR batching helpers --------------------
-const PR_MAX_BATCH_CHARS = 50_000; // Reduced from 80,000
+const PR_MAX_BATCH_CHARS = 30_000; // Reduced from 50,000
 function makeUnifiedChunk(filename, patch) {
   return `--- a/${filename}\n+++ b/${filename}\n${patch}\n\n`;
 }
@@ -211,7 +212,10 @@ function batchPRFiles(files) {
   const batches = [];
   let buf = "";
   for (const f of files) {
-    if (!f.patch) continue; // skip binary/non-text changes
+    if (!f.patch || !f.filename || f.status === "removed" || f.status === "renamed") {
+      console.log(`⚠️ Skipping file ${f.filename}: ${f.status || "no patch"}`);
+      continue; // Skip non-text, removed, or renamed files
+    }
     const chunk = makeUnifiedChunk(f.filename, f.patch);
     if ((buf.length + chunk.length) > PR_MAX_BATCH_CHARS) {
       if (buf) batches.push(buf);
@@ -227,7 +231,8 @@ function batchPRFiles(files) {
 // -------------------- PR review path (batched) --------------------
 async function runPRReview() {
   if (!OWNER || !REPO_NAME || !GITHUB_TOKEN) {
-    console.error("❌ Missing PR context or GITHUB_TOKEN for PR review."); process.exit(1);
+    console.error("❌ Missing PR context or GITHUB_TOKEN for PR review.");
+    process.exit(1);
   }
   const prNum = Number(PR_NUMBER);
   console.log(`🧩 Running PR review for ${OWNER}/${REPO_NAME} #${prNum}`);
@@ -241,7 +246,7 @@ async function runPRReview() {
   // 2) Build batches of unified diff hunks
   const batches = batchPRFiles(files);
   if (!batches.length) {
-    await postPRComment(OWNER, REPO_NAME, prNum, "No textual diff to review (binary or empty changes).");
+    await postPRComment(OWNER, REPO_NAME, prNum, "No textual diff to review (binary, empty, or non-text changes).");
     return;
   }
 
@@ -251,7 +256,8 @@ async function runPRReview() {
   // 3) Review each batch with strict JSON prompt
   for (let i = 0; i < batches.length; i++) {
     console.log(`📦 PR batch ${i+1}/${batches.length} (len=${batches[i].length})`);
-    const prompt = promptForBatch(batches[i]);
+    console.log(`📜 Batch content: ${batches[i].slice(0, 200)}...`); // Log batch for debugging
+    const prompt = promptForBatch(batches[i], true);
     let raw;
     try {
       raw = await callOpenRouter(prompt);
@@ -262,7 +268,6 @@ async function runPRReview() {
         await postPRComment(OWNER, REPO_NAME, prNum, "❌ OpenRouter returned 401 Unauthorized. Check the OPENROUTER_API_KEY secret.");
         process.exit(1);
       }
-      // Continue other batches but note the failure
       continue;
     }
 
@@ -289,8 +294,8 @@ async function runPRReview() {
 // -------------------- Full repo path --------------------
 const INCLUDE_EXTS = [".js",".ts",".jsx",".tsx",".py",".java",".go",".rb",".php",".cs",".cpp",".c",".rs",".kt",".m",".swift",".sql",".sh",".yml",".yaml",".json"];
 const EXCLUDE_DIRS = [".git","node_modules","dist","build","out",".next",".venv","venv","coverage"];
-const MAX_BATCH_CHARS = 60_000; // Reduced from 100,000
-const MAX_FILE_CHARS = 20_000; // Reduced from 40,000
+const MAX_BATCH_CHARS = 60_000;
+const MAX_FILE_CHARS = 20_000;
 const MAX_FILES = 600;
 
 const isExcludedDir = (p) => EXCLUDE_DIRS.some(d => p.split(path.sep).includes(d));
@@ -353,7 +358,7 @@ async function runFullRepo() {
 
   for (let i = 0; i < batches.length; i++) {
     console.log(`📦 Reviewing batch ${i+1}/${batches.length} with model: ${OR_MODEL} ...`);
-    const prompt = promptForBatch(batches[i]);
+    const prompt = promptForBatch(batches[i], false);
     let raw;
     try {
       raw = await callOpenRouter(prompt);
