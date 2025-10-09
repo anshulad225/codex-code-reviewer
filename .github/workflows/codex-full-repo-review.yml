@@ -1,7 +1,8 @@
 name: Codex Full Repo Review
 
 on:
-  workflow_dispatch: {}
+  # 👇 Run manually or automatically on pushes to main
+  workflow_dispatch:
   push:
     branches: [ main ]
 
@@ -12,30 +13,40 @@ jobs:
   full-review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Step 1 — Checkout your repo code
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      # Step 2 — Setup Node.js 20+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install deps
+      # Step 3 — Install dependencies
+      - name: Install dependencies
         run: |
           npm init -y >/dev/null 2>&1 || true
-          npm i @openai/codex-sdk
+          npm install @openai/codex-sdk
 
-      - name: Guard: OPENAI_API_KEY
+      # Step 4 — Confirm API key secret is available
+      - name: Check for OPENAI_API_KEY secret
         run: |
           if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "❌ Missing OPENAI_API_KEY (add in Settings → Secrets → Actions)"; exit 1;
+            echo "❌ Missing OPENAI_API_KEY secret. Please add it under Settings → Secrets → Actions."
+            exit 1
+          else
+            echo "✅ OPENAI_API_KEY found. Proceeding..."
           fi
-          echo "✅ OPENAI_API_KEY present"
 
-      - name: Run full repo review
+      # Step 5 — Run Codex full repository review
+      - name: Run Codex Full Repo Review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: node .github/tools/codex-full-review.mjs
 
-      - name: Upload artifacts
+      # Step 6 — Upload output artifacts
+      - name: Upload Codex Review Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: codex-full-review
