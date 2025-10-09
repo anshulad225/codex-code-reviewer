@@ -1,72 +1,77 @@
-name: OpenRouter Full Repo Review
+name: OpenRouter Unified Review (PR + Full Repo)
 
 on:
-  # Manual trigger from ANY branch
+  # Manual run from any branch → Full repo review
   workflow_dispatch:
-  # Auto-run on pushes to any branch (change if you want)
+  # Auto-run on pushes to any branch → Full repo review
   push:
-    branches:
-      - '**'
+    branches: ['**']
+  # Auto-run on PRs → PR diff review + comment
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
+  pull-requests: write   # needed to post a comment on PRs
 
 jobs:
-  full-review:
+  review:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # For PR mode we still check out the PR branch, which is fine for listFiles API
+          fetch-depth: 2
 
       - name: Setup Node (v20)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Debug the repo layout to avoid path issues
-      - name: List repo (debug)
+      - name: Debug layout (optional)
         run: |
-          echo "Branch: ${{ github.ref_name }}"
-          pwd
+          echo "event: ${{ github.event_name }}"
+          echo "repo:  ${{ github.repository }}"
+          echo "ref:   ${{ github.ref }}"
           ls -la
           ls -la .github || true
           ls -la .github/tools || true
 
-      # Check for required secret
-      - name: Check OpenRouter secret
+      - name: Guard secrets
         run: |
           if [ -z "${{ secrets.OPENROUTER_API_KEY }}" ]; then
-            echo " Missing OPENROUTER_API_KEY (add in Settings → Secrets and variables → Actions)."
-            exit 1
+            echo "❌ Missing OPENROUTER_API_KEY (Settings → Secrets and variables → Actions)"; exit 1;
           fi
-          echo " OPENROUTER_API_KEY present"
+          echo "✅ OPENROUTER_API_KEY present"
 
-      # Optional: set a default model if repo variable is not set
-      - name: Set default model (optional)
+      - name: Set model (optional default)
         run: |
           if [ -z "${{ vars.OPENROUTER_MODEL }}" ]; then
-            echo "No OPENROUTER_MODEL repo variable set; defaulting to openrouter/auto"
             echo "OPENROUTER_MODEL=openrouter/auto" >> $GITHUB_ENV
           else
             echo "OPENROUTER_MODEL=${{ vars.OPENROUTER_MODEL }}" >> $GITHUB_ENV
           fi
 
-      # Run the review script
-      - name: Run full repo review (OpenRouter)
+      - name: Run unified review (PR or Full Repo)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPENROUTER_MODEL: ${{ env.OPENROUTER_MODEL }}   # from repo variable or default above
-          OR_PROJECT_NAME: "GitHub Action: Full Repo Review"
+          OPENROUTER_MODEL: ${{ env.OPENROUTER_MODEL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          OR_PROJECT_NAME: "OpenRouter Unified Review"
           OR_SITE_URL: "https://github.com/${{ github.repository }}"
           GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
-        run: node .github/tools/openrouter-full-review.mjs
+        run: node .github/tools/openrouter-unified-review.mjs
 
-      # Upload the outputs (JSON + Markdown)
-      - name: Upload artifacts
+      # Only meaningful for full-repo mode; harmless for PR runs (files may or may not exist)
+      - name: Upload artifacts (full repo outputs)
+        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v4
         with:
-          name: openrouter-full-review
+          name: openrouter-review
           path: |
             codex_full_review.json
             codex_full_review.md
