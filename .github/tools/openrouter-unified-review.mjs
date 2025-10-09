@@ -1,13 +1,17 @@
 /**
- * Unified Reviewer (PR + Full Repo) via OpenRouter
- * - If PR_NUMBER is present → fetch PR diff and post a PR comment
- * - Else → scan full repo, create artifacts, write Summary
+ * openrouter-unified-review.mjs
  *
- * Requires:
- *   OPENROUTER_API_KEY  (secret)
- *   OPENROUTER_MODEL    (repo variable or default "openrouter/auto")
- * Uses:
- *   GITHUB_TOKEN, REPO, PR_NUMBER when running on PR
+ * Unified reviewer (PR diffs OR full-repo) using OpenRouter.
+ * - If PR_NUMBER is present -> reviews PR diff and posts a PR comment
+ * - Otherwise -> scans entire repo and writes artifacts (json + md) and Summary
+ *
+ * Required env:
+ *   OPENROUTER_API_KEY (secret)
+ * Optional env:
+ *   OPENROUTER_MODEL (repo variable) — defaults to "openrouter/auto"
+ *   OR_PROJECT_NAME, OR_SITE_URL (optional metadata headers)
+ * Inputs from workflow:
+ *   GITHUB_TOKEN, REPO, PR_NUMBER (when running on PR)
  */
 
 import fs from "fs";
@@ -16,46 +20,111 @@ import path from "path";
 const OR_KEY   = process.env.OPENROUTER_API_KEY;
 const OR_MODEL = process.env.OPENROUTER_MODEL || "openrouter/auto";
 const OR_BASE  = (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "");
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const REPO = process.env.REPO || "";
+const PR_NUMBER = process.env.PR_NUMBER || "";
+const IS_PR = Boolean(PR_NUMBER);
 
 if (!OR_KEY) {
-  console.error("❌ Missing OPENROUTER_API_KEY"); process.exit(1);
+  console.error("❌ Missing OPENROUTER_API_KEY env variable.");
+  process.exit(1);
 }
 
-const IS_PR = !!process.env.PR_NUMBER;
-const [owner, repo] = (process.env.REPO || "").split("/");
+const [OWNER, REPO_NAME] = REPO.split("/");
 
-// ---------- Shared helpers ----------
+// -------------------- Utilities --------------------
 function extractJsonFromText(s) {
+  if (!s || typeof s !== "string") return null;
+  // direct
   try { return JSON.parse(s); } catch {}
+  // fenced ```json ... ```
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(s);
-  if (fence) { const inner = fence[1].trim(); try { return JSON.parse(inner); } catch {} }
-  const start = s.indexOf("{"), end = s.lastIndexOf("}");
-  if (start !== -1 && end !== -1 && end > start) {
-    const candidate = s.slice(start, end + 1);
+  if (fence) {
+    const inner = fence[1].trim();
+    try { return JSON.parse(inner); } catch {}
+  }
+  // find largest balanced {...} substring
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    const candidate = s.slice(first, last + 1);
     try { return JSON.parse(candidate); } catch {}
   }
   return null;
 }
 
+function renderMarkdown(finalOut, title = "OpenRouter Review") {
+  const findings = Array.isArray(finalOut.findings) ? finalOut.findings : [];
+  const summary = finalOut.summary || "Review completed.";
+  const rows = findings.map(f =>
+    `| ${String((f.severity || "info")).toUpperCase()} | \`${f.file||"-"}\` | ${f.line ?? "-"} | ${(f.comment||"").replace(/\n/g," ")} |`
+  ).join("\n");
+  const suggestions = findings.filter(f => f.suggestion)
+    .map((f,i)=>`**Suggestion ${i+1} — ${f.file||""}:${f.line ?? ""}**\n\`\`\`\n${f.suggestion}\n\`\`\``)
+    .join("\n\n");
+  const table = findings.length
+    ? `| Severity | File | Line | Comment |\n|---|---|---|---|\n${rows}\n\n${suggestions ? `---\n${suggestions}\n` : ""}`
+    : "_No actionable findings._";
+  return `### 🤖 ${title}\n**Summary:** ${summary}\n\n${table}`;
+}
+
+// -------------------- OpenRouter call --------------------
+async function callOpenRouter(prompt) {
+  console.log(`🔎 Calling OpenRouter model: ${OR_MODEL}`);
+  const body = {
+    model: OR_MODEL,
+    temperature: 0,
+    max_tokens: 1000,
+    // response_format is honored by some routers/models; harmless if ignored
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "You are a careful, structured code reviewer that MUST return valid JSON only (one JSON object). No extra prose, no markdown, no code fences." },
+      { role: "user", content: prompt }
+    ]
+  };
+
+  const res = await fetch(`${OR_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${OR_KEY}`,
+      ...(process.env.OR_SITE_URL ? { "HTTP-Referer": process.env.OR_SITE_URL } : {}),
+      ...(process.env.OR_PROJECT_NAME ? { "X-Title": process.env.OR_PROJECT_NAME } : {})
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(()=>"");
+    throw new Error(`OpenRouter API ${res.status}: ${txt}`);
+  }
+  const j = await res.json();
+  // OpenRouter response structure: choices[0].message.content
+  const text = j?.choices?.[0]?.message?.content ?? "";
+  return text;
+}
+
+// -------------------- Prompt --------------------
 function promptForBatch(batch) {
   return `
 You are a senior code reviewer.
 
-OUTPUT REQUIREMENT:
-Return ONE JSON object only. No prose. No code fences. Valid JSON.
+OUTPUT FORMAT (MANDATORY):
+Return exactly ONE JSON object only. No prose, no markdown, no code fences. The response must be valid JSON.
 
 Schema:
 {
   "findings": [
-    { "file": "path/relative", "line": 123, "severity": "high|medium|low|info", "comment": "what & why", "suggestion"?: "minimal patch/snippet" }
+    { "file": "path/relative", "line": 123, "severity": "high|medium|low|info", "comment": "what & why", "suggestion"?: "small patch/snippet" }
   ],
-  "summary": "1–2 sentences for this batch"
+  "summary": "1-2 sentence summary for this batch"
 }
 
-If unsure:
+If you are unsure, return:
 {"findings": [], "summary": "No major issues identified in this batch."}
 
-Review for SECURITY, CORRECTNESS, PERFORMANCE, TEST COVERAGE, MAINTAINABILITY.
+Focus on SECURITY, CORRECTNESS, PERFORMANCE, TEST COVERAGE, and MAINTAINABILITY.
+Be concise and actionable.
 
 --- BEGIN INPUT ---
 ${batch}
@@ -63,112 +132,14 @@ ${batch}
 `;
 }
 
-async function callOpenRouter(prompt) {
-  console.log(`🔎 Using OpenRouter model: ${OR_MODEL}`);
-  const body = {
-    model: OR_MODEL,
-    temperature: 0,
-    max_tokens: 900,
-    response_format: { type: "json_object" }, // honored by many models; ignored by others
-    messages: [
-      { role: "system", content: "You are a careful, structured code reviewer that ALWAYS returns strict JSON for the specified schema. Never add code fences." },
-      { role: "user", content: prompt }
-    ]
-  };
-
-  const resp = await fetch(`${OR_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${OR_KEY}`,
-      ...(process.env.OR_SITE_URL ? { "HTTP-Referer": process.env.OR_SITE_URL } : {}),
-      ...(process.env.OR_PROJECT_NAME ? { "X-Title": process.env.OR_PROJECT_NAME } : {}),
-    },
-    body: JSON.stringify(body)
-  });
-
-  if (!resp.ok) {
-    const errTxt = await resp.text().catch(()=> "");
-    throw new Error(`OpenRouter API ${resp.status}: ${errTxt}`);
-  }
-  const j = await resp.json();
-  const text = j?.choices?.[0]?.message?.content ?? "";
-  return text;
-}
-
-function renderMarkdown(finalOut, title = "OpenRouter Review") {
-  const findings = finalOut.findings || [];
-  const summary = finalOut.summary || "Review completed.";
-
-  const rows = findings.map(f =>
-    `| ${String(f.severity||"info").toUpperCase()} | \`${f.file||"-"}\` | ${f.line ?? "-"} | ${(f.comment||"").replace(/\n/g," ")} |`
-  ).join("\n");
-
-  const suggestions = findings
-    .filter(f => f.suggestion)
-    .map((f,i)=>`**Suggestion ${i+1} — ${f.file||""}:${f.line ?? ""}**\n\`\`\`\n${f.suggestion}\n\`\`\``)
-    .join("\n\n");
-
-  const table = findings.length
-    ? `| Severity | File | Line | Comment |\n|---|---|---|---|\n${rows}\n\n${suggestions ? `---\n${suggestions}\n` : ""}`
-    : "_No actionable findings._";
-
-  return `### 🤖 ${title}
-**Summary:** ${summary}
-
-${table}`;
-}
-
-// ---------- PR mode (diff review) ----------
-async function runPRReview() {
-  if (!owner || !repo || !process.env.GITHUB_TOKEN) {
-    console.error("❌ Missing repo context or GITHUB_TOKEN for PR mode."); process.exit(1);
-  }
-  const prNumber = Number(process.env.PR_NUMBER);
-  console.log(`🧩 PR review for ${owner}/${repo} #${prNumber}`);
-
-  // Collect unified diff from PR files
-  const files = await githubPaginate(
-    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`,
-    process.env.GITHUB_TOKEN
-  );
-
-  let unified = "";
-  for (const f of files) {
-    if (!f.patch) continue;
-    unified += `--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}\n\n`;
-  }
-
-  if (!unified.trim()) {
-    await postPRComment(owner, repo, prNumber, "No textual diff to review.");
-    return;
-  }
-
-  const prompt = promptForBatch(unified);
-  let out;
-  try {
-    const raw = await callOpenRouter(prompt);
-    out = extractJsonFromText(raw) || { findings: [], summary: "Model did not return valid JSON." };
-  } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes("401")) {
-      await postPRComment(owner, repo, prNumber, "❌ 401 from OpenRouter. Check `OPENROUTER_API_KEY`.");
-      process.exit(1);
-    }
-    await postPRComment(owner, repo, prNumber, `OpenRouter PR review failed: \`${msg}\``);
-    throw e;
-  }
-
-  const body = renderMarkdown(out, "OpenRouter PR Review");
-  await postPRComment(owner, repo, prNumber, body);
-  console.log("✅ Posted PR review comment.");
-}
-
+// -------------------- GitHub helpers (PR mode) --------------------
 async function githubPaginate(url, token) {
   const out = [];
   let next = url;
   while (next) {
-    const res = await fetch(next, { headers: { Authorization: `Bearer ${token}`, "User-Agent": "openrouter-unified-review" } });
+    const res = await fetch(next, {
+      headers: { Authorization: `Bearer ${token}`, "User-Agent": "openrouter-unified-review" }
+    });
     if (!res.ok) throw new Error(`GitHub API ${res.status} for ${next}`);
     const page = await res.json();
     out.push(...page);
@@ -183,21 +154,66 @@ async function postPRComment(owner, repo, prNumber, body) {
   const url = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments`;
   const res = await fetch(url, {
     method: "POST",
-    headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, "User-Agent": "openrouter-unified-review" , "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, "User-Agent": "openrouter-unified-review", "Content-Type": "application/json" },
     body: JSON.stringify({ body })
   });
   if (!res.ok) {
-    const err = await res.text().catch(()=> "");
+    const err = await res.text().catch(()=>"");
     throw new Error(`Failed to post PR comment: ${res.status} ${err}`);
   }
 }
 
-// ---------- Full repo mode ----------
+// -------------------- PR review path --------------------
+async function runPRReview() {
+  if (!OWNER || !REPO_NAME || !GITHUB_TOKEN) {
+    console.error("❌ Missing PR context or GITHUB_TOKEN for PR review."); process.exit(1);
+  }
+  const prNum = Number(PR_NUMBER);
+  console.log(`🧩 Running PR review for ${OWNER}/${REPO_NAME} #${prNum}`);
+
+  // collect unified diff for PR
+  const files = await githubPaginate(`https://api.github.com/repos/${OWNER}/${REPO_NAME}/pulls/${prNum}/files?per_page=100`, GITHUB_TOKEN);
+  let unified = "";
+  for (const f of files) {
+    if (!f.patch) continue;
+    unified += `--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}\n\n`;
+  }
+
+  if (!unified.trim()) {
+    await postPRComment(OWNER, REPO_NAME, prNum, "No textual diff to review.");
+    return;
+  }
+
+  const prompt = promptForBatch(unified);
+  let raw;
+  try {
+    raw = await callOpenRouter(prompt);
+  } catch (e) {
+    const msg = String(e.message || e);
+    console.error("❌ OpenRouter call failed:", msg);
+    if (msg.includes("401")) {
+      await postPRComment(OWNER, REPO_NAME, prNum, "❌ OpenRouter returned 401 Unauthorized. Check the OPENROUTER_API_KEY secret.");
+      process.exit(1);
+    } else {
+      await postPRComment(OWNER, REPO_NAME, prNum, `OpenRouter PR review failed: \`${msg}\``);
+      throw e;
+    }
+  }
+
+  const parsed = extractJsonFromText(raw);
+  const out = parsed && typeof parsed === "object" ? parsed : { findings: [], summary: "Model did not return valid JSON." };
+
+  const body = renderMarkdown(out, "OpenRouter PR Review");
+  await postPRComment(OWNER, REPO_NAME, prNum, body);
+  console.log("✅ PR review posted.");
+}
+
+// -------------------- Full repo path --------------------
 const INCLUDE_EXTS = [".js",".ts",".jsx",".tsx",".py",".java",".go",".rb",".php",".cs",".cpp",".c",".rs",".kt",".m",".swift",".sql",".sh",".yml",".yaml",".json"];
 const EXCLUDE_DIRS = [".git","node_modules","dist","build","out",".next",".venv","venv","coverage"];
 const MAX_BATCH_CHARS = 100_000;
-const MAX_FILE_CHARS  = 40_000;
-const MAX_FILES       = 600;
+const MAX_FILE_CHARS = 40_000;
+const MAX_FILES = 600;
 
 const isExcludedDir = (p) => EXCLUDE_DIRS.some(d => p.split(path.sep).includes(d));
 const hasGoodExt = (file) => INCLUDE_EXTS.some(ext => file.toLowerCase().endsWith(ext));
@@ -242,35 +258,35 @@ function batchesFromFiles(files) {
 
 async function runFullRepo() {
   const allFiles = walk(process.cwd()).slice(0, MAX_FILES);
-  if (!allFiles.length) { console.log("No source files matched."); return; }
+  if (!allFiles.length) {
+    console.log("No source files matched INCLUDE_EXTS."); return;
+  }
   const batches = batchesFromFiles(allFiles);
-
   const allFindings = [];
   const summaries = [];
+
   for (let i = 0; i < batches.length; i++) {
     console.log(`📦 Reviewing batch ${i+1}/${batches.length} with model: ${OR_MODEL} ...`);
     const prompt = promptForBatch(batches[i]);
-
+    let raw;
     try {
-      const raw = await callOpenRouter(prompt);
-      const out = extractJsonFromText(raw) || { findings: [], summary: "Model did not return valid JSON." };
-      const f = Array.isArray(out.findings) ? out.findings : [];
-      allFindings.push(...f);
-      if (out.summary) summaries.push(String(out.summary));
+      raw = await callOpenRouter(prompt);
     } catch (e) {
       const msg = String(e.message || e);
-      if (msg.includes("401")) { console.error("❌ 401 from OpenRouter. Check key."); process.exit(1); }
       console.error(`❌ Batch ${i+1} failed: ${msg}`);
+      if (msg.includes("401")) { console.error("❌ 401 Unauthorized from OpenRouter. Check OPENROUTER_API_KEY."); process.exit(1); }
+      continue;
     }
+    const parsed = extractJsonFromText(raw);
+    const out = parsed && typeof parsed === "object" ? parsed : { findings: [], summary: "Model did not return valid JSON." };
+    const f = Array.isArray(out.findings) ? out.findings : [];
+    allFindings.push(...f);
+    if (out.summary) summaries.push(out.summary);
   }
 
-  const finalSummary = summaries.length
-    ? `Batches: ${batches.length}. ${summaries.slice(0,3).join(" ")}`
-    : `Reviewed ${allFiles.length} file(s) across ${batches.length} batch(es).`;
-
+  const finalSummary = summaries.length ? `Batches: ${batches.length}. ${summaries.slice(0,3).join(" ")}` : `Reviewed ${allFiles.length} file(s) across ${batches.length} batch(es).`;
   const finalOut = { summary: finalSummary, findings: allFindings };
 
-  // Write artifacts
   fs.writeFileSync("codex_full_review.json", JSON.stringify(finalOut, null, 2), "utf8");
   const md = renderMarkdown(finalOut, "OpenRouter Full Repo Review");
   fs.writeFileSync("codex_full_review.md", md, "utf8");
@@ -281,7 +297,7 @@ async function runFullRepo() {
   console.log(`✅ Full repo review complete. Files: ${allFiles.length}, Batches: ${batches.length}, Findings: ${allFindings.length}`);
 }
 
-// ---------- Entry ----------
+// -------------------- Entrypoint --------------------
 (async () => {
   try {
     if (IS_PR) await runPRReview();
