@@ -2,7 +2,7 @@
  * openrouter-unified-review.mjs
  *
  * Unified reviewer (PR diffs OR full-repo) using OpenRouter.
- * - If PR_NUMBER is present -> reviews PR diff and posts a PR comment
+ * - If PR_NUMBER is present -> reviews PR diff (batched) and posts a PR comment
  * - Otherwise -> scans entire repo and writes artifacts (json + md) and Summary
  *
  * Required env:
@@ -35,15 +35,15 @@ const [OWNER, REPO_NAME] = REPO.split("/");
 // -------------------- Utilities --------------------
 function extractJsonFromText(s) {
   if (!s || typeof s !== "string") return null;
-  // direct
+  // try direct
   try { return JSON.parse(s); } catch {}
-  // fenced ```json ... ```
+  // try fenced ```json ... ```
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(s);
   if (fence) {
     const inner = fence[1].trim();
     try { return JSON.parse(inner); } catch {}
   }
-  // find largest balanced {...} substring
+  // try largest {...}
   const first = s.indexOf("{");
   const last = s.lastIndexOf("}");
   if (first !== -1 && last !== -1 && last > first) {
@@ -68,6 +68,18 @@ function renderMarkdown(finalOut, title = "OpenRouter Review") {
   return `### 🤖 ${title}\n**Summary:** ${summary}\n\n${table}`;
 }
 
+function mergeFindings(all) {
+  const seen = new Set();
+  const merged = [];
+  for (const f of all) {
+    const key = `${f.file}|${f.line}|${f.severity}|${(f.comment || "").slice(0,80)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(f);
+  }
+  return merged;
+}
+
 // -------------------- OpenRouter call --------------------
 async function callOpenRouter(prompt) {
   console.log(`🔎 Calling OpenRouter model: ${OR_MODEL}`);
@@ -75,7 +87,7 @@ async function callOpenRouter(prompt) {
     model: OR_MODEL,
     temperature: 0,
     max_tokens: 1000,
-    // response_format is honored by some routers/models; harmless if ignored
+    // Honored by many models; harmless if ignored
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: "You are a careful, structured code reviewer that MUST return valid JSON only (one JSON object). No extra prose, no markdown, no code fences." },
@@ -99,7 +111,6 @@ async function callOpenRouter(prompt) {
     throw new Error(`OpenRouter API ${res.status}: ${txt}`);
   }
   const j = await res.json();
-  // OpenRouter response structure: choices[0].message.content
   const text = j?.choices?.[0]?.message?.content ?? "";
   return text;
 }
@@ -163,7 +174,29 @@ async function postPRComment(owner, repo, prNumber, body) {
   }
 }
 
-// -------------------- PR review path --------------------
+// -------------------- PR batching helpers --------------------
+const PR_MAX_BATCH_CHARS = 80_000; // smaller than full-repo to be safe
+function makeUnifiedChunk(filename, patch) {
+  return `--- a/${filename}\n+++ b/${filename}\n${patch}\n\n`;
+}
+function batchPRFiles(files) {
+  const batches = [];
+  let buf = "";
+  for (const f of files) {
+    if (!f.patch) continue; // skip binary/non-text changes
+    const chunk = makeUnifiedChunk(f.filename, f.patch);
+    if ((buf.length + chunk.length) > PR_MAX_BATCH_CHARS) {
+      if (buf) batches.push(buf);
+      buf = chunk;
+    } else {
+      buf += chunk;
+    }
+  }
+  if (buf) batches.push(buf);
+  return batches;
+}
+
+// -------------------- PR review path (batched) --------------------
 async function runPRReview() {
   if (!OWNER || !REPO_NAME || !GITHUB_TOKEN) {
     console.error("❌ Missing PR context or GITHUB_TOKEN for PR review."); process.exit(1);
@@ -171,41 +204,58 @@ async function runPRReview() {
   const prNum = Number(PR_NUMBER);
   console.log(`🧩 Running PR review for ${OWNER}/${REPO_NAME} #${prNum}`);
 
-  // collect unified diff for PR
-  const files = await githubPaginate(`https://api.github.com/repos/${OWNER}/${REPO_NAME}/pulls/${prNum}/files?per_page=100`, GITHUB_TOKEN);
-  let unified = "";
-  for (const f of files) {
-    if (!f.patch) continue;
-    unified += `--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}\n\n`;
-  }
+  // 1) Fetch PR changed files (with unified patches)
+  const files = await githubPaginate(
+    `https://api.github.com/repos/${OWNER}/${REPO_NAME}/pulls/${prNum}/files?per_page=100`,
+    GITHUB_TOKEN
+  );
 
-  if (!unified.trim()) {
-    await postPRComment(OWNER, REPO_NAME, prNum, "No textual diff to review.");
+  // 2) Build batches of unified diff hunks
+  const batches = batchPRFiles(files);
+  if (!batches.length) {
+    await postPRComment(OWNER, REPO_NAME, prNum, "No textual diff to review (binary or empty changes).");
     return;
   }
 
-  const prompt = promptForBatch(unified);
-  let raw;
-  try {
-    raw = await callOpenRouter(prompt);
-  } catch (e) {
-    const msg = String(e.message || e);
-    console.error("❌ OpenRouter call failed:", msg);
-    if (msg.includes("401")) {
-      await postPRComment(OWNER, REPO_NAME, prNum, "❌ OpenRouter returned 401 Unauthorized. Check the OPENROUTER_API_KEY secret.");
-      process.exit(1);
-    } else {
-      await postPRComment(OWNER, REPO_NAME, prNum, `OpenRouter PR review failed: \`${msg}\``);
-      throw e;
+  const allFindings = [];
+  const summaries = [];
+
+  // 3) Review each batch with strict JSON prompt
+  for (let i = 0; i < batches.length; i++) {
+    console.log(`📦 PR batch ${i+1}/${batches.length} (len=${batches[i].length})`);
+    const prompt = promptForBatch(batches[i]);
+    let raw;
+    try {
+      raw = await callOpenRouter(prompt);
+    } catch (e) {
+      const msg = String(e.message || e);
+      console.error(`❌ OpenRouter call failed on PR batch ${i+1}:`, msg);
+      if (msg.includes("401")) {
+        await postPRComment(OWNER, REPO_NAME, prNum, "❌ OpenRouter returned 401 Unauthorized. Check the OPENROUTER_API_KEY secret.");
+        process.exit(1);
+      }
+      // Continue other batches but note the failure
+      continue;
     }
+
+    const parsed = extractJsonFromText(raw);
+    const out = parsed && typeof parsed === "object"
+      ? parsed
+      : { findings: [], summary: "Model did not return valid JSON for this batch." };
+
+    if (Array.isArray(out.findings)) allFindings.push(...out.findings);
+    if (out.summary) summaries.push(String(out.summary));
   }
 
-  const parsed = extractJsonFromText(raw);
-  const out = parsed && typeof parsed === "object" ? parsed : { findings: [], summary: "Model did not return valid JSON." };
+  // 4) Merge and post a single summary comment
+  const merged = mergeFindings(allFindings);
+  const finalSummary = summaries.length
+    ? `Batches: ${batches.length}. ${summaries.slice(0, 3).join(" ")}`
+    : `Reviewed ${batches.length} batch(es).`;
 
-  const body = renderMarkdown(out, "OpenRouter PR Review");
+  const body = renderMarkdown({ summary: finalSummary, findings: merged }, "OpenRouter PR Review");
   await postPRComment(OWNER, REPO_NAME, prNum, body);
-  console.log("✅ PR review posted.");
+  console.log(`✅ PR review posted. Findings: ${merged.length}`);
 }
 
 // -------------------- Full repo path --------------------
