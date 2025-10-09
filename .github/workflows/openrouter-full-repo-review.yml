@@ -1,0 +1,56 @@
+name: OpenRouter Full Repo Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  full-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: List repo (debug)
+        run: |
+          pwd
+          ls -la
+          ls -la .github || true
+          ls -la .github/tools || true
+
+      # If you prefer node-fetch explicitly, uncomment next 2 lines and add `import fetch from "node-fetch"`
+      # - name: Install deps
+      #   run: npm init -y >/dev/null 2>&1 || true && npm i node-fetch
+
+      - name: Check OpenRouter secret
+        run: |
+          if [ -z "${{ secrets.OPENROUTER_API_KEY }}" ]; then
+            echo "❌ Missing OPENROUTER_API_KEY (add in Settings → Secrets → Actions)."; exit 1;
+          fi
+          echo "✅ OPENROUTER_API_KEY present"
+
+      - name: Run full repo review (OpenRouter)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }} # optional repo variable; defaults to router
+          OR_PROJECT_NAME: "GitHub Action: Full Repo Review"
+          OR_SITE_URL: "https://github.com/${{ github.repository }}"
+          GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
+        run: node .github/tools/openrouter-full-review.mjs
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openrouter-full-review
+          path: |
+            codex_full_review.json
+            codex_full_review.md
