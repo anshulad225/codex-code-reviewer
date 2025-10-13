@@ -7,7 +7,7 @@
  *
  * Security extras:
  * - Loads team React guidelines from .github/REVIEW_RULES/REACT_GUIDELINES.md
- * - Redacts likely secrets before sending to the model (fixed safe regexes)
+ * - Redacts likely secrets before sending to the model (safe regexes)
  * - Skips sensitive paths & allows model allowlist via env
  *
  * Required env:
@@ -64,7 +64,6 @@ const SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
 
   // Generic assignments: key/secret/token/password/authorization
-  // (no backticks; safe char classes across Node versions)
   /(?:api[_\-\s]*key|secret|token|password|passwd|authorization)\s*[:=]\s*["']?[A-Za-z0-9_-]{12,}["']?/gi,
 
   // Google-style tokens
@@ -133,7 +132,6 @@ async function callOpenRouter(prompt) {
     model: OR_MODEL,
     temperature: 0,
     max_tokens: 1000,
-    response_format: { type: "json_object" }, // honored by many models
     messages: [
       { role: "system", content:
         "You are a careful, structured React code reviewer that MUST return valid JSON only (one JSON object). " +
