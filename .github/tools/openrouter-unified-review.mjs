@@ -7,7 +7,7 @@
  *
  * Security extras:
  * - Loads team React guidelines from .github/REVIEW_RULES/REACT_GUIDELINES.md
- * - Redacts likely secrets before sending to the model
+ * - Redacts likely secrets before sending to the model (fixed safe regexes)
  * - Skips sensitive paths & allows model allowlist via env
  *
  * Required env:
@@ -58,18 +58,31 @@ if (ALLOW.length && !ALLOW.includes(OR_MODEL)) {
   process.exit(1);
 }
 
-// -------------------- Secret Redaction --------------------
+// -------------------- Secret Redaction (safe regexes) --------------------
 const SECRET_PATTERNS = [
+  // PEM private keys
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /(api[_- ]?key|secret|token|password|passwd|authorization)[^A-Za-z0-9]{0,10}["'`]?[A-Za-z0-9_\-]{12,}["'`]?/gi,
-  /\b(AIza|ya29\.)[A-Za-z0-9\-_]{20,}\b/g,     // Google-ish
-  /\bghp_[A-Za-z0-9]{20,}\b/g,                 // GitHub tokens
+
+  // Generic assignments: key/secret/token/password/authorization
+  // (no backticks; safe char classes across Node versions)
+  /(?:api[_\-\s]*key|secret|token|password|passwd|authorization)\s*[:=]\s*["']?[A-Za-z0-9_-]{12,}["']?/gi,
+
+  // Google-style tokens
+  /\b(AIza|ya29\.)[A-Za-z0-9_-]{20,}\b/g,
+
+  // GitHub Personal Access Tokens
+  /\bghp_[A-Za-z0-9]{20,}\b/g,
+
+  // AWS keys
   /\bAKIA[0-9A-Z]{16}\b/g,
-  /\baws_secret_access_key\b.*$/gim,
-  /\bsk-[A-Za-z0-9]{20,}\b/g                   // generic sk- keys
+  /\baws_secret_access_key\b\s*[:=]\s*["']?[A-Za-z0-9/+]{30,}["']?/gi,
+
+  // Generic sk- style secrets
+  /\bsk-[A-Za-z0-9]{20,}\b/g
 ];
+
 function redact(s) {
-  return SECRET_PATTERNS.reduce((t,re)=>t.replace(re,"[REDACTED]"), s);
+  return SECRET_PATTERNS.reduce((t, re) => t.replace(re, "[REDACTED]"), s);
 }
 
 // -------------------- Utilities --------------------
@@ -151,7 +164,6 @@ async function callOpenRouter(prompt) {
 
 // -------------------- Prompt --------------------
 function promptForBatch(batch) {
-  // Trim guideline size to reduce tokens
   const RULES = ORG_RULES_TEXT ? ORG_RULES_TEXT.slice(0, 18000) : "(no extra rules provided)";
   return `
 You are a senior code reviewer for a React codebase.
